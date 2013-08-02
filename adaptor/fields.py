@@ -55,6 +55,8 @@ class Field(BaseField):
 
     def get_prep_value(self, value, instance=None):
         try:
+            if isinstance(value, djangoModel):
+                return value
             value = self.prepare(value)
             if not value and self.null and self.default is not None:
                 value = self.default
@@ -125,7 +127,10 @@ class DateField(Field):
 
 
     def to_python(self, value):
-        return datetime.strptime(value, self.format)
+        if self.null:
+            return None
+        else:
+            return datetime.strptime(value, self.format)
 
 class DecimalField(Field):
     field_name = "A Decimal number"
@@ -143,7 +148,6 @@ class FloatField(Field):
 
 class IgnoredField(Field):
     field_name = "Ignore the value"
-
 
 class DjangoModelField(Field):
     field_name = "not defined"
@@ -168,6 +172,13 @@ class DjangoModelField(Field):
         except MultipleObjectsReturned:
             raise exceptions.ForeignKeyFieldError("Multiple match found for %s" % self.model.__name__, self.model.__name__, value)
 
+
+class DjangoKeyField(DjangoModelField):
+    def to_python(self, value):
+        try:
+            return self.model.objects.get(self.pk)
+        except ObjectDoesNotExist:
+            raise exceptions.ForeignKeyFieldError("No match found for %s" % self.model.__name__, self.model.__name__, value)
 
 class ComposedKeyField(DjangoModelField):
     def to_python(self, value):

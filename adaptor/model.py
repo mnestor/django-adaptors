@@ -7,7 +7,10 @@ import csv
 from django.db.models.base import Model
 from adaptor.fields import Field, IgnoredField, ComposedKeyField, XMLRootField
 from adaptor.exceptions import ForeignKeyFieldError, FieldValueMissing
+from django.db.utils import IntegrityError 
 
+import logging
+logger = logging.getLogger('blocklist.adaptor')
 
 class ImproperlyConfigured(Exception):
     """
@@ -80,9 +83,12 @@ class BaseModel(object):
        return dict((field, getattr(self, field)) for field in self.get_data_fields())
 
     def get_value(self, attr_name, field, value):
-        self.__dict__[attr_name] = field.get_prep_value(value)
+        if value == '' and field.null:
+            self.__dict__[attr_name] = None
+        else:
+            self.__dict__[attr_name] = field.get_prep_value(value)
         self.field_matching_name = field.__dict__.get("match", attr_name)
-        return field.get_prep_value(value)
+        return self.__dict__[attr_name]
 
     def update_object(self, dict_values, object, update_dict):
         new_dict_values = {}
@@ -121,7 +127,14 @@ class BaseModel(object):
             else:
                 self.update_object(dict_values, object, update_dict)
         else:
-            object = model.objects.create(**dict_values)
+            try:
+                object = model.objects.create(**dict_values)
+            except IntegrityError as e:
+                if self.silent_failure():
+                    pass
+                    raise SkipRow()
+                else:
+                    raise e
         self.object = object
 
     def get_object(self):
@@ -215,7 +228,7 @@ class CsvModel(BaseModel):
         if delimiter:
             self.delimiter = delimiter
         elif self.has_class_delimiter():
-            self.   delimiter = self.cls.Meta.delimiter
+            self.delimiter = self.cls.Meta.delimiter
         if not isinstance(data, Model):
             self.construct_obj_from_data(data)
         else:
@@ -247,7 +260,9 @@ class CsvModel(BaseModel):
                 composed_fields.append(field)
                 index_offset += 1
                 continue
-            if self.cls.has_class_delimiter() or self.delimiter:
+            if isinstance(data, dict):
+                value = data[attr_name]
+            elif self.cls.has_class_delimiter() or self.delimiter:
                 value = data.pop(position - index_offset - data_offset)
                 data_offset += 1
             else:
@@ -266,9 +281,9 @@ class CsvModel(BaseModel):
                 else:
                     value = self.get_value(attr_name, field, value)
                     self.set_values(values, self.field_matching_name, value)
-            except ValueError, e:
+            except ValueError as e:
                 if silent_failure:
-                   raise SkipRow()
+                    raise SkipRow()
                 else:
                     raise e
         if self.cls.is_db_model():
@@ -373,6 +388,10 @@ class LinearLayout(object):
                multiple_index = index 
                multiple_index_fieldname = fieldname
                break
+        if isinstance(line, dict):
+            transforms = [(t, t.split('__')[1]) for t in dir(model) if t.startswith('transform__')]
+            for t, v in transforms:
+                line[v] = model.__getattribute__(model, t)(model, line[v])
         if multiple_index:
             if not line[multiple_index:]:
                 raise ValueError("No value found for column %s" % multiple_index_fieldname) 
@@ -447,10 +466,12 @@ class CsvImporter(object):
         if self.extra_fields:
             extra_field_index = 0
             for value in self.extra_fields:
-                if isinstance(value, str):
+                if isinstance(line, dict) and isinstance(value, dict):
+                    line[value['fieldname']] = value['value']
+                elif isinstance(value, str):
                     line.append(value)
                 elif isinstance(value, dict):
-                    position = value.get('position', len(data) + extra_field_index)
+                    position = value.get('position', data_length + extra_field_index)
                     if not 'value' in value:
                         raise CsvException("If a positional extra argument is \
                                             defined, a value key should \
@@ -463,13 +484,22 @@ class CsvImporter(object):
         lines = []
         self.get_class_delimiter()
         line_number = 0
-        for line in csv.reader(data, delimiter=self.delimiter):
-            self.process_line(data, line, lines, line_number, self.csvModel)
-            line_number += 1
-        return lines
+        if self.csvModel.has_header():
+            for line in csv.DictReader(data, restval=None, delimiter=self.delimiter):
+                self.process_line(data, line, lines, line_number, self.csvModel)
+                line_number += 1
+            return lines
+        else:
+            for line in csv.reader(data, delimiter=self.delimiter):
+                self.process_line(data, line, lines, line_number, self.csvModel)
+                line_number += 1
+            return lines
 
 
     def process_line(self, data, line, lines, line_number, model):
+        if line_number == 0 and not isinstance(line, dict) and self.csvModel.has_header():
+            return None
+            
         self.process_extra_fields(data, line)
         value = None
         try:
@@ -484,7 +514,7 @@ class CsvImporter(object):
             else:
                 raise CsvDataException(line_number, field_error=e.message)
         except IndexError, e:
-            raise CsvDataException(line_number, error="Number of fields invalid")
+            raise CsvDataException(line_number, error="Number of fields invalid: "+e.message)
         return value
 
 
